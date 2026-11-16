@@ -1,135 +1,132 @@
 #!/usr/bin/env python3
-"""ai-excited-01: copy the bundled roller-coaster image to /output/entry.png.
+"""Copy the bundled roller-coaster image to the judged output path.
 
-Standard library only. Deterministic: no network, no randomness, no
-timestamps. The bundled image is checked, copied verbatim, then the
-written output is read back and checked again before success is
-reported.
+Reads entry.jpg next to this script, verifies it is a real JPEG within
+the competition limits, and writes it verbatim to entry.png under the
+output directory. The copy is read back and compared byte for byte.
+Standard library only; no network; deterministic by construction.
 """
 
 import hashlib
 import os
+import struct
 import sys
 
-# sha256 of the bundled entry.jpg, computed from the file itself.
-EXPECTED_SHA256 = "5ca7c88f957e0cbbb98a9489823d45419afc83d5f01cfd3e3309c2a4e3de026a"
+SOURCE_NAME = "entry.jpg"
+TARGET_NAME = "entry.png"
 MAX_BYTES = 1048576
-EXPECTED_WIDTH = 1024
-EXPECTED_HEIGHT = 1024
-
-# SOF markers that carry frame dimensions (baseline + progressive).
-SOF_MARKERS = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+MAX_SIDE = 1024
 
 
-class EntryImage:
-    """One image's bytes plus the facts derived from them."""
+def die(message):
+    """Print an error and exit nonzero."""
+    print("error: " + message, file=sys.stderr)
+    raise SystemExit(1)
 
-    def __init__(self, data: bytes):
+
+def script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def output_dir():
+    return os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+
+
+def load_source(directory):
+    """Read entry.jpg from directory and return it as a JpegInfo."""
+    path = os.path.join(directory, SOURCE_NAME)
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError as exc:
+        die("cannot read %s: %s" % (path, exc))
+    if not data:
+        die("source image is empty")
+    if len(data) > MAX_BYTES:
+        die("source image is %d bytes, over the %d limit"
+            % (len(data), MAX_BYTES))
+    if data[:2] != b"\xff\xd8":
+        die("source image does not start with a JPEG SOI marker")
+    if data[-2:] != b"\xff\xd9":
+        die("source image does not end with a JPEG EOI marker")
+    return JpegInfo.from_bytes(data)
+
+
+class JpegInfo:
+    """A validated JPEG: its bytes plus the size from its SOF frame."""
+
+    def __init__(self, data, width, height):
         self.data = data
-        self.sha256 = hashlib.sha256(data).hexdigest()
-        self.size = len(data)
-        self.width = None
-        self.height = None
-        self.dimensions_error = None
-        try:
-            self.width, self.height = parse_jpeg_dimensions(data)
-        except ValueError as exc:
-            self.dimensions_error = str(exc)
+        self.width = width
+        self.height = height
 
-    def problems(self, label: str) -> list:
-        """Verification failures for this image, prefixed with its label."""
-        found = []
-        if self.sha256 != EXPECTED_SHA256:
-            found.append("%s: sha256 mismatch" % label)
-        if self.size > MAX_BYTES:
-            found.append("%s: image over 1 MiB (%d bytes)" % (label, self.size))
-        if not self.data.startswith(b"\xff\xd8"):
-            found.append("%s: missing JPEG SOI marker" % label)
-        if not self.data.endswith(b"\xff\xd9"):
-            found.append("%s: missing JPEG EOI marker" % label)
-        if self.dimensions_error is not None:
-            found.append("%s: dimension parse failed: %s"
-                         % (label, self.dimensions_error))
-        elif (self.width, self.height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
-            found.append("%s: dimensions %dx%d, expected %dx%d"
-                         % (label, self.width, self.height,
-                            EXPECTED_WIDTH, EXPECTED_HEIGHT))
-        return found
+    @classmethod
+    def from_bytes(cls, data):
+        width, height = cls._frame_size(data)
+        return cls(data, width, height)
 
+    @staticmethod
+    def _frame_size(data):
+        """Scan JPEG markers for the first SOF frame, return (width, height)."""
+        pos = 2
+        while pos + 1 < len(data):
+            if data[pos] != 0xFF:
+                pos += 1
+                continue
+            marker = data[pos + 1]
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            if pos + 4 > len(data):
+                break
+            length = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+            if marker in (0xC0, 0xC1, 0xC2):
+                height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
+                return width, height
+            pos += 2 + length
+        die("no JPEG start-of-frame segment found")
 
-def parse_jpeg_dimensions(data: bytes) -> tuple:
-    """Return (width, height) from the first SOF segment of a JPEG stream."""
-    if len(data) < 4 or data[0] != 0xFF or data[1] != 0xD8:
-        raise ValueError("not a JPEG (missing SOI)")
-    pos = 2
-    while pos + 4 <= len(data):
-        if data[pos] != 0xFF:
-            raise ValueError("bad marker at offset %d" % pos)
-        marker = data[pos + 1]
-        # Standalone markers carry no length field.
-        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7 or marker == 0x01:
-            pos += 2
-            continue
-        seg_len = (data[pos + 2] << 8) | data[pos + 3]
-        if seg_len < 2 or pos + 2 + seg_len > len(data):
-            raise ValueError("truncated segment at offset %d" % pos)
-        if marker in SOF_MARKERS:
-            if seg_len < 7:
-                raise ValueError("SOF segment too short")
-            height = (data[pos + 5] << 8) | data[pos + 6]
-            width = (data[pos + 7] << 8) | data[pos + 8]
-            return width, height
-        if marker == 0xDA:  # SOS: entropy data follows, no more headers.
-            raise ValueError("no SOF segment before scan data")
-        pos += 2 + seg_len
-    raise ValueError("no SOF segment found")
+    def validate(self):
+        if self.width > MAX_SIDE or self.height > MAX_SIDE:
+            die("image is %dx%d, over the %dx%d limit"
+                % (self.width, self.height, MAX_SIDE, MAX_SIDE))
+        if self.width <= 0 or self.height <= 0:
+            die("image has a non-positive dimension")
 
 
-def read_file(path: str) -> bytes:
-    with open(path, "rb") as fh:
-        return fh.read()
+def read_back(dest):
+    try:
+        with open(dest, "rb") as handle:
+            return handle.read()
+    except OSError as exc:
+        die("cannot read back %s: %s" % (dest, exc))
 
 
-def write_file(path: str, data: bytes) -> None:
-    with open(path, "wb") as fh:
-        fh.write(data)
+def publish_copy(data, dest):
+    """Write data to dest, read it back, and return its sha256 hex digest."""
+    parent = os.path.dirname(dest)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    try:
+        with open(dest, "wb") as handle:
+            handle.write(data)
+    except OSError as exc:
+        die("cannot write %s: %s" % (dest, exc))
+    written = read_back(dest)
+    if written != data:
+        die("read-back of %s differs from the source bytes" % dest)
+    return hashlib.sha256(written).hexdigest()
 
 
-def fail(problems: list) -> int:
-    for problem in problems:
-        print("VERIFICATION FAILED:", problem, file=sys.stderr)
-    return 1
-
-
-def main() -> int:
-    here = os.path.dirname(os.path.abspath(__file__))
-    source = os.path.join(here, "entry.jpg")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    dest = os.path.join(out_dir, "entry.png")
-
-    bundled = EntryImage(read_file(source))
-    problems = bundled.problems("bundled image")
-    if problems:
-        return fail(problems)
-
-    os.makedirs(out_dir, exist_ok=True)
-    write_file(dest, bundled.data)
-
-    # Read the output back and verify it is byte-identical to the source.
-    written = EntryImage(read_file(dest))
-    problems = written.problems("written output")
-    if problems:
-        return fail(problems)
-    if written.data != bundled.data:
-        return fail(["written output: bytes differ from bundled image"])
-
-    print("sha256:", written.sha256)
-    print("size:", written.size, "bytes")
-    print("dimensions: %dx%d" % (written.width, written.height))
-    print("wrote:", dest)
-    return 0
+def main():
+    image = load_source(script_dir())
+    image.validate()
+    print("source ok: %s (%d bytes, %dx%d)"
+          % (SOURCE_NAME, len(image.data), image.width, image.height))
+    dest = os.path.join(output_dir(), TARGET_NAME)
+    digest = publish_copy(image.data, dest)
+    print("wrote %s sha256 %s" % (dest, digest))
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
